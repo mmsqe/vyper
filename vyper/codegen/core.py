@@ -1,3 +1,5 @@
+import hashlib
+
 import vyper.codegen.context as ctx
 from vyper.codegen.ir_node import Encoding, IRnode
 from vyper.compiler.settings import _opt_codesize, _opt_gas, _opt_none
@@ -34,6 +36,68 @@ from vyper.semantics.types.user import FlagT
 from vyper.utils import GAS_COPY_WORD, GAS_IDENTITY, GAS_IDENTITYWORD, ceil32
 
 DYNAMIC_ARRAY_OVERHEAD = 1
+
+# Hard minimum below which CODECOPY lowering is never worthwhile: the fixed
+# instruction overhead (push-length, push-dst, push-label, push-size,
+# codecopy, mstore) plus the label bytes dominates.
+_CONST_BYTESTRING_MIN_DATA_SECTION_LEN = 48
+
+# Approximate fixed byte overhead of the codecopy lowering, compared to the
+# inline MSTORE chain. Covers the ``PUSH dst_offset / PUSH label / PUSH len /
+# CODECOPY`` sequence on top of the shared ``mstore(ptr, len)``. Intentionally
+# generous to avoid regressing sparse/zero-heavy literals, which Vyper's push
+# optimizer compresses very effectively.
+_CONST_BYTESTRING_CODECOPY_FIXED_OVERHEAD = 16
+
+
+def _should_use_data_section_for_bytestring(bytez: bytes) -> bool:
+    """
+    Decide whether a constant bytestring literal should be emitted into the
+    runtime data section and read via CODECOPY, versus an inline MSTORE chain.
+
+    Vyper's assembler shrinks ``PUSH32 <small_int>`` to the smallest PUSH
+    that fits (down to PUSH0), so a 32-byte word with few significant bytes
+    is cheaper as ``PUSH<k> + MSTORE`` than as 32 raw code bytes reached via
+    CODECOPY. We estimate both sizes and pick the smaller; in a tie, prefer
+    inline MSTORE to avoid growing the relocation surface.
+    """
+    n = len(bytez)
+    if n < _CONST_BYTESTRING_MIN_DATA_SECTION_LEN:
+        return False
+
+    # Estimate inline MSTORE chain bytes (per 32-byte word):
+    #   PUSH<k> (1 + k bytes of immediate) + PUSH dst_offset (~2 bytes)
+    #   + MSTORE (1 byte)
+    # where k = significant bytes of the word (0..32, with k=0 using PUSH0).
+    _PER_WORD_MSTORE_OVERHEAD = 4  # push-offset + mstore + push opcode
+    mstore_cost = 0
+    for i in range(0, n, 32):
+        word = bytez[i : i + 32].rjust(32, b"\x00") if n - i < 32 else bytez[i : i + 32]
+        # significant bytes = 32 minus the leading-zero count
+        sig = 32 - (len(word) - len(word.lstrip(b"\x00")))
+        mstore_cost += _PER_WORD_MSTORE_OVERHEAD + sig
+
+    codecopy_cost = n + _CONST_BYTESTRING_CODECOPY_FIXED_OVERHEAD
+    return codecopy_cost < mstore_cost
+
+
+def register_const_bytestring(module_ctx, bytez: bytes) -> str:
+    """
+    Register a source-level constant bytestring for emission in the runtime
+    data section. Returns a label name usable with
+    ``["codecopy", dst, ["symbol", label], len]``.
+
+    Identical bytestrings share one data section entry.
+    """
+    items = getattr(module_ctx, "_const_bytestring_data_items", None)
+    if items is None:
+        items = {}
+        module_ctx._const_bytestring_data_items = items
+
+    key = hashlib.sha256(bytez).hexdigest()[:16]
+    if key not in items:
+        items[key] = (f"_const_bytestring_{key}", bytez)
+    return items[key][0]
 
 
 def is_bytes_m_type(typ):

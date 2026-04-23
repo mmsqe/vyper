@@ -418,6 +418,10 @@ def _selector_section_linear(external_functions, module_t):
 
 # take a ModuleT, and generate the runtime and deploy IR
 def generate_ir_for_module(module_t: ModuleT) -> tuple[IRnode, IRnode]:
+    # reset any registry state carried from a previous codegen of the same
+    # module (e.g. during re-compilation or tests that share a ModuleT)
+    module_t._const_bytestring_data_items = {}
+
     # order functions so that each function comes after all of its callees
     id_generator = IDGenerator()
     runtime_reachable = _runtime_reachable_functions(module_t, id_generator)
@@ -463,6 +467,15 @@ def generate_ir_for_module(module_t: ModuleT) -> tuple[IRnode, IRnode]:
     runtime.append(["label", "fallback", ["var_list"], fallback_ir])
 
     runtime.extend(internal_functions_ir)
+
+    # Emit data sections for source-level constant bytestrings that were
+    # registered during codegen. Each entry becomes a sibling in the runtime
+    # IR and is referenced by the corresponding `codecopy` emitted in
+    # _make_bytelike. (See issue #2505.)
+    const_bytestring_items = getattr(module_t, "_const_bytestring_data_items", None)
+    if const_bytestring_items:
+        for label, bytez in const_bytestring_items.values():
+            runtime.append(["data", label, bytez])
 
     deploy_code: List[Any] = ["seq"]
     immutables_len = module_t.immutable_section_bytes

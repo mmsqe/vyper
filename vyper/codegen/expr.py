@@ -5,6 +5,7 @@ import vyper.codegen.arithmetic as arithmetic
 from vyper import ast as vy_ast
 from vyper.codegen import external_call, self_call
 from vyper.codegen.core import (
+    _should_use_data_section_for_bytestring,
     append_dyn_array,
     check_assign,
     clamp,
@@ -22,6 +23,7 @@ from vyper.codegen.core import (
     pop_dyn_array,
     potential_overlap,
     read_write_overlap,
+    register_const_bytestring,
     sar,
     shl,
     shr,
@@ -150,14 +152,32 @@ class Expr:
         placeholder = context.new_internal_variable(btype)
         seq = []
         seq.append(["mstore", placeholder, bytez_length])
-        for i in range(0, len(bytez), 32):
+
+        # Dense literals in runtime code are cheaper via a runtime data
+        # section + CODECOPY than via a chain of PUSH/MSTORE pairs. Sparse
+        # literals (mostly leading zeros per word) stay inline because
+        # Vyper's push optimizer compresses them below raw-byte size.
+        # Init-code literals stay inline because init code cannot reach its
+        # own runtime data section via CODECOPY (issue #2505).
+        use_data_section = (
+            not context.is_ctor_context
+            and _should_use_data_section_for_bytestring(bytez)
+        )
+
+        if use_data_section:
+            label = register_const_bytestring(context.module_ctx, bytez)
             seq.append(
-                [
-                    "mstore",
-                    ["add", placeholder, i + 32],
-                    bytes_to_int((bytez + b"\x00" * 31)[i : i + 32]),
-                ]
+                ["codecopy", ["add", placeholder, 32], ["symbol", label], bytez_length]
             )
+        else:
+            for i in range(0, len(bytez), 32):
+                seq.append(
+                    [
+                        "mstore",
+                        ["add", placeholder, i + 32],
+                        bytes_to_int((bytez + b"\x00" * 31)[i : i + 32]),
+                    ]
+                )
 
         ret = IRnode.from_list(
             ["seq"] + seq + [placeholder],
